@@ -41,13 +41,15 @@ def fmt_plain(x, dec=0):
         return str(x)
 
 # =========================
-# Cohortes FIFO (parche KeyError)
+# Cohortes FIFO (core)
 # =========================
 def monthly_fifo_cohorts(df):
     """
-    Construye una matriz de cohortes aproximada (FIFO) usando agregados mensuales.
-    df requiere columnas: Date, Plan, New Customers, Lost Customers.
-    Devuelve dos pivots: total y por plan (retención %).
+    Construye una matriz de cohorts aproximada (FIFO) con datos agregados mensuales.
+    Requiere columnas: Date, Plan, New Customers, Lost Customers.
+    Devuelve:
+      - pivot_total: index=Cohort (mes alta), columns=Age (months), valores=Retention %
+      - pivot_plan: index=(Plan, Cohort), columns=Age (months), valores=Retention %
     """
     work = df.copy()
     work["Date"] = pd.to_datetime(work["Date"]).dt.to_period("M").dt.to_timestamp()
@@ -103,7 +105,7 @@ def monthly_fifo_cohorts(df):
     # Filtrar registros válidos
     res = res[~res["Initial"].isna() & (res["Initial"] > 0)]
 
-    # ---------- Pivot TOTAL (robusto, sin 'Initial_cohort') ----------
+    # Pivot TOTAL (suma global por cohorte → m0 = 100% correcto)
     total_rem = (res.groupby(["Cohort", "Age (months)"])["Remaining"]
                    .sum().reset_index())
     total_init = res.groupby("Cohort")["Initial"].sum()
@@ -114,13 +116,11 @@ def monthly_fifo_cohorts(df):
                                   columns="Age (months)",
                                   values="Retention %").sort_index()
 
-    # ---------- Pivot POR PLAN (promedio ponderado por tamaño cohorte) ----------
+    # Pivot POR PLAN (media ponderada por tamaño cohorte)
     res["Weight"] = res["Initial"]
-
     def _wavg(x):
         w = x["Weight"]
         return np.average((x["Remaining"] / x["Initial"]) * 100.0, weights=w)
-
     res_plan = (res.groupby(["Plan", "Cohort", "Age (months)"])
                   .apply(_wavg)
                   .reset_index(name="Retention %"))
@@ -384,79 +384,52 @@ st.dataframe(table.sort_values("MRR (€)", ascending=False), use_container_widt
 st.divider()
 
 # =========================
-# Cohorts por año de alta (aprox. FIFO) — vista simplificada
+# Cohorts (aprox. FIFO) — HEATMAP visual con cálculo corregido
 # =========================
-st.subheader("Cohorts por año de alta (aprox. FIFO)")
+st.subheader("Cohorts por mes de alta — Heatmap (aprox. FIFO)")
 
-# UI: selector de plan y slider de horizonte
+# Selector de plan y horizonte
 plan_opts = ["(Todos)"] + sorted(df_prices["Plan"].astype(str).unique().tolist())
 plan_for_cohorts = st.selectbox("Plan para cohorts", plan_opts, index=0)
 horizon = st.slider("Horizonte (meses)", 6, 24, 12)
 
-# Base para cohortes (aplica filtro de plan si procede)
+# Filtramos base por plan (si aplica)
 base = df_data[["Date", "Plan", "New Customers", "Lost Customers"]].copy()
 if plan_for_cohorts != "(Todos)":
     base = base[base["Plan"] == plan_for_cohorts]
 
-# Ejecuta el modelo FIFO
-pivot_total, pivot_plan = monthly_fifo_cohorts(base)
+# Ejecutamos FIFO sobre la base filtrada
+pivot_total, _ = monthly_fifo_cohorts(base)
 
-# Elegimos la matriz de retención (cohort-month rows x age columns)
-if plan_for_cohorts == "(Todos)":
-    ret = pivot_total.copy()
-else:
-    # pivot_plan tiene MultiIndex (Plan, Cohort). Nos quedamos con el plan elegido.
-    if (plan_for_cohorts,) in pivot_plan.index.names:  # safety (old pandas names)
-        ret = pivot_plan.xs(plan_for_cohorts, level="Plan", drop_level=True).copy()
-    else:
-        try:
-            ret = pivot_plan.loc[plan_for_cohorts].copy()
-        except Exception:
-            ret = pd.DataFrame()
-
-if ret.empty:
+if pivot_total.empty:
     st.info("No hay datos suficientes para construir cohorts con la selección actual.")
 else:
-    # Recorta columnas al horizonte seleccionado (m0..mH)
-    # Identifica columnas de edad (0,1,2,...) y limítalas
-    age_cols = [c for c in ret.columns if isinstance(c, (int, np.integer))]
-    age_cols = [c for c in age_cols if c >= 0]
-    age_cols = sorted(age_cols)[:horizon + 1]  # incluye m0..m_h
+    # Limitamos el horizonte y pasamos a formato largo
+    age_cols = [c for c in pivot_total.columns if isinstance(c, (int, np.integer)) and c >= 0]
+    age_cols = sorted(age_cols)[:horizon + 1]
 
-    # Necesitamos tamaños de cohorte (Initial) por mes de alta para ponderar por AÑO
-    base_m = base.copy()
-    base_m["Date"] = pd.to_datetime(base_m["Date"]).dt.to_period("M").dt.to_timestamp()
-    init_by_cohort_month = base_m.groupby("Date")["New Customers"].sum()  # tamaño de cada cohorte (mes)
+    ret = pivot_total[age_cols].copy()
+    ret = ret.reset_index()
+    ret["CohortLabel"] = ret["Cohort"].dt.strftime("%Y-%m")
+    long = ret.melt(id_vars=["Cohort", "CohortLabel"], value_vars=age_cols,
+                    var_name="Age", value_name="Retention")
 
-    # Ret lleva índice Cohort (timestamp). Creamos tabla con 'Year' y 'Initial'
-    ret_w = ret[age_cols].reset_index().rename(columns={"Cohort": "Cohort"})
-    ret_w["Year"] = ret_w["Cohort"].dt.year
-    ret_w["Initial"] = ret_w["Cohort"].map(init_by_cohort_month).fillna(0)
+    # Heatmap Altair
+    heat = alt.Chart(long).mark_rect().encode(
+        x=alt.X('Age:O', title='Edad del cohort (meses)'),
+        y=alt.Y('CohortLabel:N', title='Mes de alta', sort='-y'),
+        color=alt.Color('Retention:Q', title='Retención %', scale=alt.Scale(domain=[0,100])),
+        tooltip=[
+            alt.Tooltip('CohortLabel:N', title='Cohort'),
+            alt.Tooltip('Age:O', title='Edad (m)'),
+            alt.Tooltip('Retention:Q', title='Retención %', format='.1f')
+        ]
+    ).properties(height=320)
 
-    # Agregado anual ponderado por tamaño de cohorte (Initial)
-    out_rows = []
-    for year, g in ret_w.groupby("Year"):
-        w = g["Initial"].values
-        if w.sum() == 0:
-            continue
-        row = {"Cohort Year": year, "Initial": int(w.sum())}
-        for a in age_cols:
-            vals = g[a].values  # % de retención en ese age para cada cohorte del año
-            row[f"m{a}"] = float(np.average(vals, weights=w))
-        out_rows.append(row)
+    st.altair_chart(heat, use_container_width=True)
+    st.caption("Cada fila es el **mes de alta**. Las columnas son la **edad del cohort** (m0..mN). El color indica la **supervivencia (%)**. En **(Todos)** se calcula con suma global (m0 = 100%).")
 
-    if not out_rows:
-        st.info("No hay altas (New Customers) para construir cohorts.")
-    else:
-        out = pd.DataFrame(out_rows).sort_values("Cohort Year")
-        # Formateo bonito
-        fmt_cols = [c for c in out.columns if c.startswith("m")]
-        out_display = out.copy()
-        for c in fmt_cols:
-            out_display[c] = out_display[c].map(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
-
-        st.caption("Cada fila es el **año de alta**, columnas m0..mN son la **supervivencia (%)** del cohort a esa edad.")
-        st.dataframe(out_display, use_container_width=True)
+st.divider()
 
 # =========================
 # Valoración
