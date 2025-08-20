@@ -384,27 +384,79 @@ st.dataframe(table.sort_values("MRR (€)", ascending=False), use_container_widt
 st.divider()
 
 # =========================
-# Cohortes (total y por plan)
+# Cohorts por año de alta (aprox. FIFO) — vista simplificada
 # =========================
-st.subheader("Cohortes (aprox. FIFO) — total y por plan")
-cohort_total, cohort_plan = monthly_fifo_cohorts(df_data[["Date","Plan","New Customers","Lost Customers"]])
+st.subheader("Cohorts por año de alta (aprox. FIFO)")
 
-cols = st.columns(2)
-with cols[0]:
-    st.markdown("**Cohortes — Total (retención %)**")
-    if cohort_total.empty:
-        st.info("No hay datos suficientes para cohortes.")
+# UI: selector de plan y slider de horizonte
+plan_opts = ["(Todos)"] + sorted(df_prices["Plan"].astype(str).unique().tolist())
+plan_for_cohorts = st.selectbox("Plan para cohorts", plan_opts, index=0)
+horizon = st.slider("Horizonte (meses)", 6, 24, 12)
+
+# Base para cohortes (aplica filtro de plan si procede)
+base = df_data[["Date", "Plan", "New Customers", "Lost Customers"]].copy()
+if plan_for_cohorts != "(Todos)":
+    base = base[base["Plan"] == plan_for_cohorts]
+
+# Ejecuta el modelo FIFO
+pivot_total, pivot_plan = monthly_fifo_cohorts(base)
+
+# Elegimos la matriz de retención (cohort-month rows x age columns)
+if plan_for_cohorts == "(Todos)":
+    ret = pivot_total.copy()
+else:
+    # pivot_plan tiene MultiIndex (Plan, Cohort). Nos quedamos con el plan elegido.
+    if (plan_for_cohorts,) in pivot_plan.index.names:  # safety (old pandas names)
+        ret = pivot_plan.xs(plan_for_cohorts, level="Plan", drop_level=True).copy()
     else:
-        st.dataframe(cohort_total.style.format('{:.0f}'), use_container_width=True, height=400)
+        try:
+            ret = pivot_plan.loc[plan_for_cohorts].copy()
+        except Exception:
+            ret = pd.DataFrame()
 
-with cols[1]:
-    st.markdown("**Cohortes — Por plan (retención %)**")
-    if cohort_plan.empty:
-        st.info("No hay datos suficientes para cohortes por plan.")
+if ret.empty:
+    st.info("No hay datos suficientes para construir cohorts con la selección actual.")
+else:
+    # Recorta columnas al horizonte seleccionado (m0..mH)
+    # Identifica columnas de edad (0,1,2,...) y limítalas
+    age_cols = [c for c in ret.columns if isinstance(c, (int, np.integer))]
+    age_cols = [c for c in age_cols if c >= 0]
+    age_cols = sorted(age_cols)[:horizon + 1]  # incluye m0..m_h
+
+    # Necesitamos tamaños de cohorte (Initial) por mes de alta para ponderar por AÑO
+    base_m = base.copy()
+    base_m["Date"] = pd.to_datetime(base_m["Date"]).dt.to_period("M").dt.to_timestamp()
+    init_by_cohort_month = base_m.groupby("Date")["New Customers"].sum()  # tamaño de cada cohorte (mes)
+
+    # Ret lleva índice Cohort (timestamp). Creamos tabla con 'Year' y 'Initial'
+    ret_w = ret[age_cols].reset_index().rename(columns={"Cohort": "Cohort"})
+    ret_w["Year"] = ret_w["Cohort"].dt.year
+    ret_w["Initial"] = ret_w["Cohort"].map(init_by_cohort_month).fillna(0)
+
+    # Agregado anual ponderado por tamaño de cohorte (Initial)
+    out_rows = []
+    for year, g in ret_w.groupby("Year"):
+        w = g["Initial"].values
+        if w.sum() == 0:
+            continue
+        row = {"Cohort Year": year, "Initial": int(w.sum())}
+        for a in age_cols:
+            vals = g[a].values  # % de retención en ese age para cada cohorte del año
+            row[f"m{a}"] = float(np.average(vals, weights=w))
+        out_rows.append(row)
+
+    if not out_rows:
+        st.info("No hay altas (New Customers) para construir cohorts.")
     else:
-        st.dataframe(cohort_plan.style.format('{:.0f}'), use_container_width=True, height=400)
+        out = pd.DataFrame(out_rows).sort_values("Cohort Year")
+        # Formateo bonito
+        fmt_cols = [c for c in out.columns if c.startswith("m")]
+        out_display = out.copy()
+        for c in fmt_cols:
+            out_display[c] = out_display[c].map(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
 
-st.divider()
+        st.caption("Cada fila es el **año de alta**, columnas m0..mN son la **supervivencia (%)** del cohort a esa edad.")
+        st.dataframe(out_display, use_container_width=True)
 
 # =========================
 # Valoración
