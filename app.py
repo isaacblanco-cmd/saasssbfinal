@@ -384,7 +384,7 @@ st.dataframe(table.sort_values("MRR (€)", ascending=False), use_container_widt
 st.divider()
 
 # =========================
-# Cohorts (aprox. FIFO) — HEATMAP visual con cálculo corregido
+# Cohorts (aprox. FIFO) — HEATMAP visual con m0=100% y meses sin cohortes
 # =========================
 st.subheader("Cohorts por mes de alta — Heatmap (aprox. FIFO)")
 
@@ -393,41 +393,118 @@ plan_opts = ["(Todos)"] + sorted(df_prices["Plan"].astype(str).unique().tolist()
 plan_for_cohorts = st.selectbox("Plan para cohorts", plan_opts, index=0)
 horizon = st.slider("Horizonte (meses)", 6, 24, 12)
 
-# Filtramos base por plan (si aplica)
+# Base de datos para cohorts (solo las columnas necesarias)
 base = df_data[["Date", "Plan", "New Customers", "Lost Customers"]].copy()
 if plan_for_cohorts != "(Todos)":
     base = base[base["Plan"] == plan_for_cohorts]
 
-# Ejecutamos FIFO sobre la base filtrada
-pivot_total, _ = monthly_fifo_cohorts(base)
+# --- FIFO corregido: m0 siempre 100% (no restar churn del mismo mes de alta) ---
+def _fifo_retention_rows(df):
+    df = df.sort_values(["Plan", "Date"]).reset_index(drop=True)
+    rows = []
+    for plan, g in df.groupby("Plan", sort=False):
+        queue = []          # lista de [cohort_month, remaining]
+        initial_map = {}    # tamaño inicial por cohorte (mes alta)
+        for month, gm in g.groupby("Date", sort=True):
+            new_c = int(gm["New Customers"].sum())
+            lost_c = int(gm["Lost Customers"].sum())
 
-if pivot_total.empty:
+            # 1) Añadir cohorte nuevo (si lo hay)
+            if new_c > 0:
+                queue.append([month, new_c])
+                initial_map[month] = new_c
+
+            # 2) Aplicar bajas SOLO a cohortes previas (no al cohort creado este mismo mes)
+            remaining_to_remove = lost_c
+            qi = 0
+            while remaining_to_remove > 0 and qi < len(queue):
+                cohort_month, remaining = queue[qi]
+                if cohort_month == month:   # no tocar el cohort del mes actual
+                    qi += 1
+                    continue
+                take = min(remaining, remaining_to_remove)
+                queue[qi][1] -= take
+                remaining_to_remove -= take
+                if queue[qi][1] == 0:
+                    qi += 1
+            queue = [q for q in queue if q[1] > 0]
+
+            # 3) Registrar estado de todas las cohortes vivas en este mes
+            for cohort_month, remaining in queue:
+                rows.append({
+                    "Plan": plan,
+                    "Cohort": cohort_month,
+                    "Month": month,
+                    "Remaining": remaining,
+                    "Initial": initial_map.get(cohort_month, np.nan)
+                })
+    if not rows:
+        return pd.DataFrame()
+    res = pd.DataFrame(rows)
+    res["Age (months)"] = (
+        (res["Month"].dt.year - res["Cohort"].dt.year) * 12 +
+        (res["Month"].dt.month - res["Cohort"].dt.month)
+    ).astype(int)
+    res["Retention %"] = res["Remaining"] / res["Initial"] * 100.0
+    return res
+
+res = _fifo_retention_rows(base)
+
+if res.empty:
     st.info("No hay datos suficientes para construir cohorts con la selección actual.")
 else:
-    # Limitamos el horizonte y pasamos a formato largo
+    # --- Construir pivot TOTAL usando suma global por cohorte (m0 = 100%) ---
+    # Remaining total por (Cohort, Age)
+    total_rem = (res.groupby(["Cohort", "Age (months)"])["Remaining"]
+                   .sum().reset_index())
+    # Initial total por Cohort
+    total_init = res.groupby("Cohort")["Initial"].sum()
+    total_rem["Initial_total"] = total_rem["Cohort"].map(total_init)
+    total_rem = total_rem[total_rem["Initial_total"] > 0]
+    total_rem["Retention %"] = (total_rem["Remaining"] / total_rem["Initial_total"]) * 100.0
+    pivot_total = total_rem.pivot(index="Cohort", columns="Age (months)", values="Retention %").sort_index()
+
+    # --- Asegurar filas para meses SIN cohortes (mostrar guiones) ---
+    all_months = pd.period_range(base["Date"].min().to_period("M"), base["Date"].max().to_period("M"), freq="M").to_timestamp()
+    pivot_total = pivot_total.reindex(all_months)  # añade filas vacías para meses sin altas
+
+    # --- Limitar al horizonte y preparar datos largos para heatmap ---
     age_cols = [c for c in pivot_total.columns if isinstance(c, (int, np.integer)) and c >= 0]
-    age_cols = sorted(age_cols)[:horizon + 1]
+    age_cols = sorted(age_cols)[:horizon + 1]  # m0..mN
+    pivot_show = pivot_total[age_cols].copy()
 
-    ret = pivot_total[age_cols].copy()
-    ret = ret.reset_index()
-    ret["CohortLabel"] = ret["Cohort"].dt.strftime("%Y-%m")
-    long = ret.melt(id_vars=["Cohort", "CohortLabel"], value_vars=age_cols,
-                    var_name="Age", value_name="Retention")
+    # Para tooltip bonito (— en NaN) y etiquetas de fila
+    df_long = pivot_show.reset_index().rename(columns={"index": "Cohort"})
+    df_long["CohortLabel"] = df_long["Cohort"].dt.strftime("%Y-%m")
+    df_long = df_long.melt(id_vars=["Cohort", "CohortLabel"], value_vars=age_cols,
+                           var_name="Age", value_name="Retention")
+    df_long["RetentionStr"] = df_long["Retention"].map(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
 
-    # Heatmap Altair
-    heat = alt.Chart(long).mark_rect().encode(
+    # Detectar meses sin cohortes (toda la fila NaN)
+    months_without_cohort = pivot_show.index[pivot_show.isna().all(axis=1)]
+    months_without_cohort_lbl = [d.strftime("%Y-%m") for d in months_without_cohort]
+
+    # --- Heatmap (Altair) ---
+    heat = alt.Chart(df_long).mark_rect().encode(
         x=alt.X('Age:O', title='Edad del cohort (meses)'),
         y=alt.Y('CohortLabel:N', title='Mes de alta', sort='-y'),
-        color=alt.Color('Retention:Q', title='Retención %', scale=alt.Scale(domain=[0,100])),
+        color=alt.Color('Retention:Q', title='Retención %', scale=alt.Scale(domain=[0, 100])),
         tooltip=[
             alt.Tooltip('CohortLabel:N', title='Cohort'),
             alt.Tooltip('Age:O', title='Edad (m)'),
-            alt.Tooltip('Retention:Q', title='Retención %', format='.1f')
+            alt.Tooltip('RetentionStr:N', title='Retención %')
         ]
     ).properties(height=320)
 
     st.altair_chart(heat, use_container_width=True)
-    st.caption("Cada fila es el **mes de alta**. Las columnas son la **edad del cohort** (m0..mN). El color indica la **supervivencia (%)**. En **(Todos)** se calcula con suma global (m0 = 100%).")
+    st.caption("Cada fila es el **mes de alta**. Las columnas son la **edad del cohort** (m0..mN). El color indica la **supervivencia (%)**. "
+               "En **(Todos)** se usa suma global (garantiza m0=100%). Los meses **sin cohortes** aparecen como filas vacías (celdas ‘—’ en tooltip).")
+
+    if months_without_cohort_lbl:
+        st.markdown(
+            "Meses sin cohortes (sin altas): " +
+            ", ".join(f"`{m}`" for m in months_without_cohort_lbl)
+        )
 
 st.divider()
 
